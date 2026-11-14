@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Forecast BTC's price `horizon_minutes` ahead from 72h of 1-minute closes.
 
-Model: last price plus a damped drift. The per-minute log returns are fit as an
-AR(1), r_t = c + phi*r_{t-1}; the expected cumulative log return over the next
-`horizon_minutes` is projected, shrunk by DAMPING, and compounded onto the last
-close. Everything is deterministic (no randomness), stdlib only, no network.
+Model: last price plus the fitted drift. The per-minute log returns are fit as
+an AR(1), r_t = c + phi*r_{t-1}; the expected cumulative log return over the
+next `horizon_minutes` is projected (no extra shrink: the AR(1) already
+mean-reverts through phi) and compounded onto the last close. The lookback
+window feeding the fit is self-tuned over a small grid by walk-forward
+validation on the case's own history, keeping the window with the smallest mean
+absolute hold-out error. Everything is deterministic (no randomness), stdlib
+only, no network.
 """
 
 import json
@@ -16,8 +20,10 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
-# Damped drift: keep 90% of the fitted per-minute drift when projecting ahead.
-DAMPING = 0.9
+# Candidate lookback windows (minutes of history feeding the AR(1) fit). The
+# best one is chosen per case by walk-forward validation, so the model adapts to
+# each case's own recent regime instead of pinning a fixed window.
+LOOKBACK_GRID = (720, 1080, 1440, 1800, 2160, 2520, 2880, 3600, 4320)
 
 
 def price5(x):
@@ -26,15 +32,14 @@ def price5(x):
     return math.floor(x * 1e5 + 0.5) / 1e5
 
 
-def forecast(prices, horizon):
-    n = len(prices)
-    last = prices[-1]
+def _ar1_forecast(series, horizon):
+    """Fit AR(1) on `series`'s minute log returns and project `horizon` ahead."""
+    n = len(series)
     if n < 2:
-        return price5(last)
-
-    returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, n)]
+        return None
+    returns = [math.log(series[i] / series[i - 1]) for i in range(1, n)]
     if len(returns) < 2:
-        return price5(last)
+        return None
 
     # OLS fit of AR(1): r_t = c + phi * r_{t-1}
     y = returns[1:]
@@ -56,14 +61,56 @@ def forecast(prices, horizon):
     phi = max(-0.9, min(0.9, phi))
     r0 = returns[-1]
 
-    # Expected cumulative log return over the next `horizon` minutes.
+    # Expected cumulative log return over the next `horizon` minutes. The AR(1)
+    # already mean-reverts through phi, so the projected drift is not shrunk
+    # further (an extra damping factor double-counted that mean reversion).
     if abs(1.0 - phi) < 1e-12:
         total = c * horizon + r0 * horizon
     else:
         g = phi * (1.0 - phi ** horizon) / (1.0 - phi)
         total = (c / (1.0 - phi)) * (horizon - g) + r0 * g
 
-    return price5(last * math.exp(total * DAMPING))
+    return series[-1] * math.exp(total)
+
+
+def forecast(prices, horizon):
+    n = len(prices)
+    last = prices[-1]
+    if n < 2:
+        return price5(last)
+
+    # Self-tune the lookback window: for each candidate, run a walk-forward
+    # backtest over the case's own history (every non-overlapping `horizon`
+    # block) and score it by mean absolute error; keep the best window.
+    best_lookback = None
+    best_err = None
+    for lookback in LOOKBACK_GRID:
+        total = 0.0
+        count = 0
+        end = n - horizon
+        while end >= 2:
+            start = max(0, end - lookback)
+            pred = _ar1_forecast(prices[start:end], horizon)
+            if pred is not None:
+                actual = prices[end + horizon] if end + horizon < n else last
+                total += abs(pred - actual)
+                count += 1
+            end -= horizon
+        if count == 0:
+            continue
+        err = total / count
+        if best_err is None or err < best_err:
+            best_err = err
+            best_lookback = lookback
+
+    if best_lookback is None:
+        return price5(last)
+
+    start = max(0, n - best_lookback)
+    pred = _ar1_forecast(prices[start:], horizon)
+    if pred is None:
+        return price5(last)
+    return price5(pred)
 
 
 def main():
