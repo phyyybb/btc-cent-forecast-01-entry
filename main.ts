@@ -10,7 +10,7 @@
 //         + 0.10 * mean(last 90 closes)
 //         + 0.07 * (last - close 45 minutes ago) / 45 * 240
 //
-// i.e. a slightly mean-reverted persistence plus 7% of the last 45 minutes' per-minute
+// i.e. a slightly mean-reverted persistence (rev 3) plus 7% of the last 45 minutes' per-minute
 // drift carried over the 240-minute horizon, kept on the grid's 5 decimals and inside
 // the scorer's bounds. Two runs on the same case write the same guess: no clock, no
 // randomness, one pass over the prices.
